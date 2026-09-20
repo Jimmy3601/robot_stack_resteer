@@ -13,7 +13,7 @@ from pathlib import Path
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 import logging
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import requests
 
@@ -202,6 +202,74 @@ class GlobalState:
         self.command_condition = threading.Condition()
         self.server_ready = False
         self.history = self._load_history()
+        self.input_session = None
+        self.last_input_poll = None
+        self.scheduled_commands = []
+        self.schedule_started_at = None
+        self.schedule_state = 'idle'
+        self.schedule_reason = ''
+        self.schedule_sent = 0
+        self.execution_phase = None
+        self.execution_elapsed = 0.0
+        self.execution_reported_at = 0.0
+
+    # Call these helpers under command_condition. Schedules are consumed by the
+    # robot's input polls, never by a browser timer or an independent robot client.
+    def cancel_schedule(self, reason):
+        if self.schedule_state in ('armed', 'running'):
+            self.scheduled_commands.clear()
+            self.schedule_state = 'cancelled'
+            self.schedule_reason = reason
+            self.command_condition.notify_all()
+
+    def expire_schedule(self, now):
+        if self.last_input_poll is not None and now - self.last_input_poll > 5.0:
+            self.cancel_schedule('disconnected')
+            if self.execution_phase == 'running':
+                self.execution_elapsed += max(0, self.last_input_poll - self.execution_reported_at)
+            self.execution_phase = 'disconnected'
+
+    def update_execution(self, phase, elapsed, now):
+        self.execution_phase = phase
+        self.execution_elapsed = elapsed
+        self.execution_reported_at = now
+        if phase == 'running' and self.schedule_state == 'armed':
+            # The client reports time since key 1, so polling latency does not
+            # shift the schedule origin to when the host first sees the start.
+            self.schedule_started_at = now - elapsed
+            self.schedule_state = 'running'
+        elif phase == 'stopped':
+            self.cancel_schedule('episode_changed')
+
+    def execution_status(self, now):
+        elapsed = self.execution_elapsed
+        if self.execution_phase == 'running':
+            elapsed += max(0, now - self.execution_reported_at)
+        return {'phase': self.execution_phase, 'elapsed_seconds': elapsed}
+
+    def schedule_status(self):
+        now = time.monotonic()
+        self.expire_schedule(now)
+        next_command = self.scheduled_commands[0] if self.scheduled_commands else None
+        return {'state': self.schedule_state, 'reason': self.schedule_reason,
+                'sent': self.schedule_sent, 'remaining': len(self.scheduled_commands),
+                'next_instruction': next_command['instruction'] if next_command else None,
+                'seconds_remaining': max(0, self.schedule_started_at + next_command['after_seconds'] - now)
+                if next_command and self.schedule_started_at is not None else None,
+                'execution': self.execution_status(now)}
+
+    def take_due_instruction(self, now):
+        if self.schedule_state != 'running' or not self.scheduled_commands:
+            return None
+        entry = self.scheduled_commands[0]
+        if now < self.schedule_started_at + entry['after_seconds']:
+            return None
+        self.scheduled_commands.pop(0)
+        self.schedule_sent += 1
+        self.save_command(entry['instruction'], entry['chinese'])
+        if not self.scheduled_commands:
+            self.schedule_state = 'completed'
+        return entry['instruction']
 
     def _load_history(self):
         if HISTORY_FILE.exists():
@@ -317,6 +385,25 @@ HTML_PAGE = """
         .history-item:hover { background:#f8f9fa; border-color:#3498db; color:#3498db; transform:translateX(5px); }
         .history-english { color:#2c3e50; line-height:1.45; }
         .history-chinese { margin-top:6px; color:#6b7c8f; line-height:1.45; }
+        .timer-panel { text-align:left; border:1px solid var(--line); border-radius:8px; padding:16px; margin:16px 0; }
+        .timer-toggle { display:flex; gap:10px; align-items:center; font-weight:700; }
+        .timer-toggle input { width:18px; height:18px; }
+        .timer-hint { color:var(--muted); font-size:13px; line-height:1.6; }
+        .schedule-row { display:grid; grid-template-columns:100px 110px minmax(0,1fr) 40px; gap:8px; align-items:start; margin:12px 0; }
+        .schedule-row label { font-size:12px; color:var(--muted); display:flex; flex-direction:column; gap:6px; }
+        .schedule-row input,.schedule-row select { box-sizing:border-box; width:100%; padding:10px 6px; border:1px solid var(--line); border-radius:6px; font:inherit; }
+        .schedule-row textarea { height:76px; min-height:76px; padding:8px; font-size:14px; }
+        .schedule-row button { margin-top:22px; padding:9px; font-size:16px; }
+        .secondary { padding:10px 14px; font-size:14px; background:var(--soft-gray); color:var(--ink); width:auto; }
+        .secondary:hover:not(:disabled) { background:var(--line); }
+        #scheduleStatus { white-space:pre-wrap; overflow-wrap:anywhere; margin-top:12px; }
+        #cancelSchedule { margin-top:8px; color:var(--danger); }
+        .stopwatch { margin:16px 0; padding:14px; background:var(--soft-gray); border-radius:8px; }
+        #stopwatchValue { display:block; font:600 32px ui-monospace,monospace; font-variant-numeric:tabular-nums; margin:5px 0; }
+        #stopwatchLabel,#stopwatchState { color:var(--muted); font-size:13px; }
+        @media(max-width:600px) { body { margin:8px auto; padding:8px; } .card { padding:16px; }
+            .schedule-row { grid-template-columns:90px 1fr 40px; } .schedule-text { grid-column:1/3; grid-row:2; }
+            .schedule-row button { grid-column:3; grid-row:1; } }
     </style>
 </head>
 <body class="status-idle">
@@ -324,6 +411,11 @@ HTML_PAGE = """
         <div id="indicator" class="idle-msg"></div>
         <h1 id="pageTitle"></h1>
         <div id="modeHint" class="mode-hint"></div>
+        <div class="stopwatch">
+            <span id="stopwatchLabel"></span>
+            <output id="stopwatchValue" role="timer">00:00.0</output>
+            <span id="stopwatchState"></span>
+        </div>
         <form id="cmdForm">
             <div id="grid" class="grid single">
                 <div class="input-group" id="englishGroup">
@@ -338,6 +430,16 @@ HTML_PAGE = """
                     <label class="input-label" id="chineseLabel" for="chineseInstruction">Chinese</label>
                     <textarea id="chineseInstruction" placeholder="..." disabled autocomplete="off" lang="zh-CN"></textarea>
                 </div>
+            </div>
+            <div class="timer-panel">
+                <label class="timer-toggle"><input type="checkbox" id="timedMode"><span id="timedModeLabel"></span></label>
+                <div id="scheduleEditor" hidden>
+                    <p id="scheduleHint" class="timer-hint"></p>
+                    <div id="scheduleRows"></div>
+                    <button type="button" id="addScheduleRow" class="secondary"></button>
+                </div>
+                <div id="scheduleStatus" class="timer-hint" role="status" aria-live="polite"></div>
+                <button type="button" id="cancelSchedule" class="secondary" hidden></button>
             </div>
             <div id="statusLine" class="status-line"></div>
             <button type="submit" id="submitBtn" disabled></button>
@@ -361,7 +463,15 @@ HTML_PAGE = """
                 translating:"Translating...", translated:"Translation complete", translateFail:"Translation failed",
                 enterToTranslate:"Enter text to translate first", emptyInstr:"Instruction is empty", enterCn:"Enter a Chinese instruction",
                 enterInstr:"Enter an instruction", instrSent:"Instruction sent", sendFail:"Send failed",
-                emptyEn:"English instruction is empty", noEnglish:"(no English)"
+                emptyEn:"English instruction is empty", noEnglish:"(no English)",
+                timedMode:"Timed mode", timerHint:"Set and send the plan before execution, then press 1 (Pedal 1) to start the timer and stopwatch. Every delay is measured from that confirmation. Follow-up instructions send automatically, even if you close this page. Chinese text is translated before the plan is sent.",
+                afterSeconds:"After (seconds)", language:"Language", followUp:"Next instruction", addRow:"+ Add instruction", removeRow:"Remove instruction",
+                startTimer:"Send Plan — Then Press 1 to Start", cancelTimer:"Cancel remaining instructions",
+                timerArmed:"Plan ready — waiting for 1 (Pedal 1); timing has not started.",
+                stopwatch:"Execution stopwatch", clockWaiting:"Waiting for 1 to start", clockRunning:"Timing from confirmation", clockStopped:"Execution ended", clockDisconnected:"Disconnected — last known elapsed time",
+                invalidSchedule:"Add 1–32 instructions with increasing times greater than 0 and up to 86400 seconds, and fill in every instruction.",
+                timerRunning:"Automatic schedule running", timerNext:"Next in", seconds:"s", timerRemaining:"remaining", timerComplete:"All scheduled instructions sent.",
+                timerCancelled:"Schedule cancelled", timerUser:"by you", timerReplaced:"a new instruction was submitted", timerEpisode:"the episode or inference client changed", timerDisconnected:"the inference client disconnected", statusUnavailable:"Cannot reach the instruction server. The timer may still be running; reconnect to check."
             },
             cn: {
                 title:"机器人指令终端", idle:"推理程序暂未请求输入，等待中…",
@@ -374,7 +484,15 @@ HTML_PAGE = """
                 translating:"翻译中…", translated:"翻译完成", translateFail:"翻译失败",
                 enterToTranslate:"请先输入要翻译的文本", emptyInstr:"指令为空", enterCn:"请输入中文指令",
                 enterInstr:"请输入指令", instrSent:"指令已发送", sendFail:"发送失败",
-                emptyEn:"英文指令为空", noEnglish:"（无英文）"
+                emptyEn:"英文指令为空", noEnglish:"（无英文）",
+                timedMode:"定时模式", timerHint:"执行前设置并发送计划，再按 1（踏板 1）确认开始，定时和秒表才会启动。下面的时间均从这次确认算起。后续指令自动发送，关闭网页也会继续。中文指令会在发送计划前完成翻译。",
+                afterSeconds:"延迟（秒）", language:"输入语言", followUp:"后续指令", addRow:"＋ 添加指令", removeRow:"删除这条指令",
+                startTimer:"发送计划，等待按 1 开始", cancelTimer:"取消剩余定时指令",
+                timerArmed:"计划已就绪，等待按 1（踏板 1）确认；尚未开始计时。",
+                stopwatch:"执行秒表", clockWaiting:"等待按 1 开始", clockRunning:"从按 1 确认时开始计时", clockStopped:"执行已结束", clockDisconnected:"连接已断开，显示最后已知时间",
+                invalidSchedule:"请添加 1–32 条指令，时间须递增、大于 0 且不超过 86400 秒，每条指令不能为空。",
+                timerRunning:"定时任务进行中", timerNext:"下一条将在", seconds:"秒后发送", timerRemaining:"条待发送", timerComplete:"所有定时指令已发送。",
+                timerCancelled:"定时任务已取消", timerUser:"手动取消", timerReplaced:"已发送新的指令", timerEpisode:"任务已复位或推理客户端已更换", timerDisconnected:"推理客户端已断开", statusUnavailable:"无法连接指令服务。定时任务可能仍在运行，请恢复连接后查看。"
             }
         };
         const L = T[MODE==='cn' ? 'cn' : 'en'];
@@ -383,14 +501,100 @@ HTML_PAGE = """
               grid=el('grid'), englishGroup=el('englishGroup'), chineseGroup=el('chineseGroup'),
               translateControls=el('translateControls'), toChineseBtn=el('toChineseBtn'), toEnglishBtn=el('toEnglishBtn'),
               btn=el('submitBtn'), indicator=el('indicator'), statusLine=el('statusLine'),
-              historyList=el('historyList'), modeHint=el('modeHint'), body=document.body;
+              historyList=el('historyList'), modeHint=el('modeHint'), body=document.body,
+              timedMode=el('timedMode'), scheduleEditor=el('scheduleEditor'), scheduleRows=el('scheduleRows'),
+              addScheduleRow=el('addScheduleRow'), cancelSchedule=el('cancelSchedule'), scheduleStatus=el('scheduleStatus');
 
         el('pageTitle').textContent=L.title; el('englishLabel').textContent=L.enLabel;
         el('chineseLabel').textContent=L.zhLabel; el('historyTitle').textContent=L.historyTitle;
         btn.textContent=L.submit; indicator.textContent=L.idle;
+        el('timedModeLabel').textContent=L.timedMode; el('scheduleHint').textContent=L.timerHint;
+        addScheduleRow.textContent=L.addRow; cancelSchedule.textContent=L.cancelTimer;
+        el('stopwatchLabel').textContent=L.stopwatch;
 
         let lastHistoryJSON="", waiting=false, busy=false, translating=false, lastModified='zh';
         let lastTranslated={en:"",zh:""};
+        let scheduleActive=false, scheduleBusy=false;
+        const scheduleInputs=[];
+        let clockSample={phase:'waiting',elapsed_seconds:0}, clockReceivedAt=performance.now();
+
+        function renderStopwatch(){
+            let elapsed=Number(clockSample.elapsed_seconds)||0;
+            if(clockSample.phase==='running') elapsed+=Math.min(5,Math.max(0,(performance.now()-clockReceivedAt)/1000));
+            const tenths=Math.floor(Math.max(0,elapsed)*10);
+            el('stopwatchValue').textContent=`${String(Math.floor(tenths/600)).padStart(2,'0')}:${String(Math.floor(tenths/10)%60).padStart(2,'0')}.${tenths%10}`;
+            const labels={running:L.clockRunning,stopped:L.clockStopped,disconnected:L.clockDisconnected};
+            el('stopwatchState').textContent=labels[clockSample.phase]||L.clockWaiting;
+        }
+        function syncStopwatch(execution){
+            clockSample=execution; clockReceivedAt=performance.now(); renderStopwatch();
+        }
+        setInterval(renderStopwatch,100); renderStopwatch();
+
+        function addRow(){
+            if(scheduleInputs.length>=32) return;
+            const row=document.createElement('div'); row.className='schedule-row';
+            const delay=document.createElement('input'); delay.type='number'; delay.min='0.1'; delay.max='86400'; delay.step='any';
+            delay.value=String(scheduleInputs.length ? Number(scheduleInputs[scheduleInputs.length-1].delay.value)+10 : 10);
+            const language=document.createElement('select');
+            for(const [value,label] of [['en',L.enLabel],['zh',L.zhLabel]]){
+                const option=document.createElement('option'); option.value=value; option.textContent=label; language.appendChild(option);
+            }
+            language.value=MODE==='cn'?'zh':'en';
+            const text=document.createElement('textarea'); text.placeholder=L.phType;
+            for(const [label,input,cls] of [[L.afterSeconds,delay,''],[L.language,language,''],[L.followUp,text,'schedule-text']]){
+                const wrapper=document.createElement('label'); wrapper.textContent=label; wrapper.className=cls; wrapper.appendChild(input); row.appendChild(wrapper);
+            }
+            const remove=document.createElement('button'); remove.type='button'; remove.className='secondary'; remove.textContent='×'; remove.title=L.removeRow; remove.setAttribute('aria-label',L.removeRow);
+            const entry={row,delay,language,text,remove};
+            remove.onclick=()=>{ scheduleInputs.splice(scheduleInputs.indexOf(entry),1); row.remove(); refresh(); };
+            row.appendChild(remove); scheduleRows.appendChild(row); scheduleInputs.push(entry); refresh();
+        }
+        timedMode.onchange=()=>{ scheduleEditor.hidden=!timedMode.checked; if(timedMode.checked&&!scheduleInputs.length) addRow(); refresh(); };
+        addScheduleRow.onclick=addRow;
+
+        function showSchedule(s){
+            scheduleActive=Boolean(s&&['armed','running'].includes(s.state)); cancelSchedule.hidden=!scheduleActive;
+            if(s&&s.execution) syncStopwatch(s.execution);
+            if(!s||s.state==='idle') scheduleStatus.textContent='';
+            else if(s.state==='armed') scheduleStatus.textContent=L.timerArmed;
+            else if(s.state==='running') scheduleStatus.textContent=`${L.timerRunning} · ${s.remaining} ${L.timerRemaining}\n${L.timerNext} ${Number(s.seconds_remaining).toFixed(1)} ${L.seconds}: ${s.next_instruction}`;
+            else if(s.state==='completed') scheduleStatus.textContent=L.timerComplete;
+            else {
+                const reasons={user:L.timerUser,replaced:L.timerReplaced,episode_changed:L.timerEpisode,disconnected:L.timerDisconnected};
+                scheduleStatus.textContent=`${L.timerCancelled}: ${reasons[s.reason]||s.reason}`;
+            }
+            refresh();
+        }
+        cancelSchedule.onclick=async()=>{
+            if(scheduleBusy||busy) return;
+            scheduleBusy=true; refresh();
+            try{
+                const r=await fetch('/cancel_schedule',{method:'POST'});
+                if(!r.ok) throw new Error(L.sendFail);
+                showSchedule({state:'cancelled',reason:'user'}); await poll();
+            }catch(e){ setStatus(e.message,'error'); }
+            finally{scheduleBusy=false;refresh();}
+        };
+
+        async function prepareSchedule(){
+            if(!timedMode.checked) return [];
+            const rows=scheduleInputs.map(x=>({after_seconds:Number(x.delay.value),text:x.text.value.trim(),language:x.language.value}));
+            if(!rows.length||rows.length>32||rows.some((x,i)=>!Number.isFinite(x.after_seconds)||x.after_seconds<0.1||x.after_seconds>86400||!x.text||(i&&x.after_seconds<=rows[i-1].after_seconds))) throw new Error(L.invalidSchedule);
+            const result=[];
+            for(const x of rows){
+                let instruction=x.text, chinese='';
+                if(x.language==='zh'){
+                    setStatus(L.translating,'working');
+                    const r=await fetch('/translate',{method:'POST',body:new URLSearchParams({text:x.text,from:'zh-CHS',to:'en'})});
+                    const d=await r.json();
+                    if(!r.ok||!d.translation||!d.translation.trim()) throw new Error(d.error||L.translateFail);
+                    instruction=d.translation.trim(); chinese=x.text;
+                }
+                result.push({after_seconds:x.after_seconds,instruction,chinese});
+            }
+            return result;
+        }
 
         // Layout per mode
         if (MODE==='dev') {
@@ -409,8 +613,13 @@ HTML_PAGE = """
         if (MODE==='dev'){ englishInput.addEventListener('input',()=>lastModified='en'); chineseInput.addEventListener('input',()=>lastModified='zh'); }
 
         function refresh(){
-            const locked = !waiting || busy || translating;
+            const locked = !waiting || busy || translating || scheduleBusy;
             btn.disabled=locked;
+            btn.textContent=timedMode.checked?L.startTimer:L.submit;
+            timedMode.disabled=busy||translating||scheduleBusy;
+            addScheduleRow.disabled=busy||translating||scheduleBusy||scheduleInputs.length>=32;
+            scheduleInputs.forEach(x=>{ for(const input of [x.delay,x.language,x.text,x.remove]) input.disabled=!timedMode.checked||busy||translating||scheduleBusy; });
+            cancelSchedule.disabled=!scheduleActive||busy||translating||scheduleBusy;
             englishInput.disabled = (MODE==='en'||MODE==='dev') ? locked : true;
             chineseInput.disabled = (MODE==='cn'||MODE==='dev') ? locked : true;
             if (MODE==='dev'){ toChineseBtn.disabled=locked; toEnglishBtn.disabled=locked; }
@@ -462,7 +671,10 @@ HTML_PAGE = """
             if(waiting&&!was) (MODE==='cn'?chineseInput:englishInput).focus();
         }
 
-        async function poll(){ try{ const d=await (await fetch('/status')).json(); setWaiting(d.waiting); if(d.history) updateHistory(d.history);}catch(e){} }
+        async function poll(){
+            try{ const r=await fetch('/status'); if(!r.ok) throw new Error(L.statusUnavailable); const d=await r.json(); setWaiting(d.waiting); if(d.history) updateHistory(d.history); showSchedule(d.schedule); }
+            catch(e){ setWaiting(false); scheduleStatus.textContent=L.statusUnavailable; syncStopwatch({phase:'disconnected',elapsed_seconds:clockSample.elapsed_seconds}); }
+        }
         setInterval(poll,800);
 
         async function ensureEnglish(){
@@ -482,13 +694,14 @@ HTML_PAGE = """
         }
 
         form.onsubmit=async e=>{
-            e.preventDefault(); if(!waiting||busy||translating) return;
+            e.preventDefault(); if(!waiting||busy||translating||scheduleBusy) return;
             busy=true; refresh(); const orig=L.submit;
             try{
                 if(!await ensureEnglish()) return;
                 const en=englishInput.value.trim();
                 if(!en){ setStatus(L.emptyEn,"error"); return; }
-                const r=await fetch('/web_submit',{method:'POST',body:new URLSearchParams({instruction:en, chinese:chineseInput.value.trim()})});
+                const schedule=await prepareSchedule();
+                const r=await fetch('/web_submit',{method:'POST',body:new URLSearchParams({instruction:en, chinese:chineseInput.value.trim(),schedule:JSON.stringify(schedule)})});
                 const d=await r.json().catch(()=>({}));
                 if(!r.ok||d.accepted===false) throw new Error(d.error||L.sendFail);
                 btn.textContent=L.sent; setStatus(L.instrSent,"ok"); setTimeout(()=>btn.textContent=orig,1000);
@@ -514,21 +727,36 @@ class InteractionHandler(BaseHTTPRequestHandler):
         return
 
     def do_GET(self):
-        if self.path == '/':
+        path = urlsplit(self.path).path
+        if path == '/':
             self._send_html()
-        elif self.path == '/status':
+        elif path == '/status':
             with state.command_condition:
                 status = {"waiting": state.is_robot_waiting and state.current_command is None,
-                          "history": list(state.history)}
+                          "history": list(state.history), 'schedule': state.schedule_status()}
             self._send_json(status)
-        elif self.path == '/get_input':
-            self._handle_robot_request()
+        elif path == '/get_input':
+            params = parse_qs(urlsplit(self.path).query)
+            session = params.get('session', [None])[0]
+            phase = params.get('execution', [None])[0]
+            try:
+                elapsed = float(params.get('elapsed', ['0'])[0])
+                if phase not in (None, 'waiting', 'running', 'stopped') or not math.isfinite(elapsed) or elapsed < 0:
+                    raise ValueError('Invalid execution clock')
+            except ValueError:
+                self._send_json({'error': 'Invalid execution clock'}, 400)
+                return
+            self._handle_robot_request(session, phase, elapsed)
         else:
             self.send_error(404)
 
     def do_POST(self):
         if self.path == '/web_submit':
             self._handle_web_submit()
+        elif self.path == '/cancel_schedule':
+            with state.command_condition:
+                state.cancel_schedule('user')
+            self._send_json({'cancelled': True})
         elif self.path == '/translate':
             self._handle_translate()
         elif self.path.startswith('/play/'):
@@ -536,20 +764,45 @@ class InteractionHandler(BaseHTTPRequestHandler):
         else:
             self.send_error(404)
 
-    def _handle_robot_request(self):
+    def _handle_robot_request(self, session=None, execution=None, elapsed=0.0):
         # A bounded poll releases disconnected clients and lets the robot stop
         # accepting instructions during reset. There is only one consumer.
         with state.command_condition:
             if state.is_robot_waiting:
                 self._send_json({"error": "Another input request is active"}, 409)
                 return
+            now = time.monotonic()
+            state.expire_schedule(now)
+            if session != state.input_session:
+                state.cancel_schedule('episode_changed')
+                state.current_command = None
+            state.input_session = session
+            state.last_input_poll = now
+            state.update_execution(execution, elapsed, now)
+            if execution == 'stopped':
+                state.current_command = None
+                self._send_json({'instruction': None})
+                return
             state.is_robot_waiting = True
             try:
-                state.command_condition.wait_for(lambda: state.current_command is not None, timeout=1.0)
+                deadline = now + 1.0
+                while state.current_command is None:
+                    now = time.monotonic()
+                    instruction = state.take_due_instruction(now)
+                    if instruction is not None:
+                        state.current_command = instruction
+                        break
+                    wait = deadline - now
+                    if wait <= 0:
+                        break
+                    if state.schedule_state == 'running' and state.scheduled_commands:
+                        wait = min(wait, state.schedule_started_at + state.scheduled_commands[0]['after_seconds'] - now)
+                    state.command_condition.wait(timeout=wait)
                 instruction = state.current_command
                 state.current_command = None
             finally:
                 state.is_robot_waiting = False
+                state.last_input_poll = time.monotonic()
         self._send_json({"instruction": instruction})
         if instruction:
             logger.info(f"✅ Instruction delivered: '{instruction}'")
@@ -561,14 +814,52 @@ class InteractionHandler(BaseHTTPRequestHandler):
         if not instr:
             self._send_json({"accepted": False, "error": "Instruction cannot be empty"}, 400)
             return
+        try:
+            schedule = self._parse_schedule(params.get('schedule', ['[]'])[0])
+        except (ValueError, TypeError) as exc:
+            self._send_json({'accepted': False, 'error': str(exc)}, 400)
+            return
         with state.command_condition:
             if not state.is_robot_waiting or state.current_command is not None:
                 self._send_json({"accepted": False, "error": "Inference program is not requesting input; retry shortly"}, 409)
                 return
+            if schedule and (not state.input_session or state.execution_phase is None):
+                self._send_json({'accepted': False, 'error': 'Restart the updated inference client to use timed mode'}, 409)
+                return
+            if schedule and state.execution_phase != 'waiting':
+                self._send_json({'accepted': False, 'error': 'Set the timed plan before pressing 1 to start execution'}, 409)
+                return
+            state.cancel_schedule('replaced')
             state.current_command = instr
             state.save_command(instr, chinese)
+            if schedule:
+                state.scheduled_commands = schedule
+                state.schedule_started_at = None
+                state.schedule_state = 'armed'
+                state.schedule_reason = ''
+                state.schedule_sent = 0
             state.command_condition.notify()
         self._send_json({"accepted": True})
+
+    @staticmethod
+    def _parse_schedule(raw):
+        entries = json.loads(raw)
+        if not isinstance(entries, list) or len(entries) > 32:
+            raise ValueError('Schedule must be a list of at most 32 instructions')
+        result, previous = [], 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise ValueError('Invalid scheduled instruction')
+            delay, instruction = entry.get('after_seconds'), entry.get('instruction')
+            chinese = entry.get('chinese', '')
+            if (isinstance(delay, bool) or not isinstance(delay, (float, int))
+                    or not previous < delay <= 86400 or not math.isfinite(delay)):
+                raise ValueError('Times must increase, be greater than zero, and be at most 86400 seconds')
+            if not isinstance(instruction, str) or not instruction.strip() or not isinstance(chinese, str):
+                raise ValueError('Every scheduled instruction needs non-empty text')
+            result.append({'after_seconds': delay, 'instruction': instruction.strip(), 'chinese': chinese.strip()})
+            previous = delay
+        return result
 
     def _handle_translate(self):
         params = self._read_form()

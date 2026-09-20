@@ -2,6 +2,7 @@
 import os
 import cv2
 import time
+import uuid
 import bisect
 import shlex
 import signal
@@ -210,6 +211,8 @@ class ModelInterfaceNode(Node):
         self.state = SystemState.IDLE
         self.current_instr = ""
         self.episode_generation = 0
+        self.execution_started_at = None
+        self.execution_elapsed = 0.0
 
         self.action_queue = deque(maxlen=200)
         self.action_queue_copy = list(self.action_queue)
@@ -528,6 +531,9 @@ class ModelInterfaceNode(Node):
         # Reset must invalidate pending inference without waiting for the network.
         if new_state == SystemState.RESETTING:
             with self.action_timer_lock:
+                if self.execution_started_at is not None:
+                    self.execution_elapsed = time.monotonic() - self.execution_started_at
+                self.execution_started_at = None
                 self._execute_switch_state(new_state)
                 self.episode_generation += 1
                 self.current_instr = ""
@@ -1281,27 +1287,39 @@ class ModelInterfaceNode(Node):
 
     def remote_input_loop(self):
         """Receive instructions before and during execution using bounded long polls."""
+        input_client_id = uuid.uuid4().hex
         self.get_logger().info(f"🌐 Remote input loop started: waiting to connect to {self.ui_host}:{self.ui_port}")
         while rclpy.ok():
             with self.action_timer_lock:
                 accepting_input = self.state != SystemState.RESETTING
                 episode_generation = self.episode_generation
-            if accepting_input:
-                try:
-                    url = f"http://{self.ui_host}:{self.ui_port}/get_input"
-                    response = self.ui_session.get(url, timeout=(3.0, 5.0))
-                    response.raise_for_status()
-                    instruction = response.json().get("instruction")
-                    if instruction is not None:
-                        self.update_instruction(instruction, episode_generation)
-                except requests.exceptions.ConnectionError as e:
-                    self.get_logger().warn(f"⚠️  Cannot connect to host service: {e}")
-                    time.sleep(2.0)
-                except Exception as e:
-                    self.get_logger().warn(f"⚠️  Error fetching remote input: {e}")
-                    time.sleep(1.0)
-            else:
+                execution, elapsed = self._execution_clock_snapshot()
+            try:
+                url = f"http://{self.ui_host}:{self.ui_port}/get_input"
+                response = self.ui_session.get(
+                    url, params={'session': f'{input_client_id}:{episode_generation}',
+                                 'execution': execution, 'elapsed': elapsed},
+                    timeout=(3.0, 5.0))
+                response.raise_for_status()
+                instruction = response.json().get("instruction")
+                if accepting_input and instruction is not None:
+                    self.update_instruction(instruction, episode_generation)
+            except requests.exceptions.ConnectionError as e:
+                self.get_logger().warn(f"⚠️  Cannot connect to host service: {e}")
+                time.sleep(2.0)
+            except Exception as e:
+                self.get_logger().warn(f"⚠️  Error fetching remote input: {e}")
+                time.sleep(1.0)
+            if not accepting_input:
                 time.sleep(0.5)
+
+    def _execution_clock_snapshot(self):
+        """Read under action_timer_lock; the clock starts only on a valid key 1."""
+        if self.state == SystemState.RESETTING:
+            return 'stopped', self.execution_elapsed
+        if self.execution_started_at is not None:
+            return 'running', max(0.0, time.monotonic() - self.execution_started_at)
+        return 'waiting', 0.0
 
     def on_key_press(self, key):
         try:
@@ -1338,6 +1356,7 @@ class ModelInterfaceNode(Node):
             return
 
         if self.state == SystemState.READY:
+            confirmed_at = time.monotonic()
             self.get_logger().info(f"▶️  User pressed '1': starting first observation (instruction='{self.current_instr}')")
             self._start_human_input_nodes()
             if self.human_in_the_loop:
@@ -1345,7 +1364,10 @@ class ModelInterfaceNode(Node):
             self._transition_commander('model')
             self.play_sound("start")
             self.pub_system_mode.publish(String(data="execution"))
-            self._switch_state(SystemState.FIRST_OBS)
+            with self.action_timer_lock:
+                self._switch_state(SystemState.FIRST_OBS)
+                self.execution_started_at = confirmed_at
+                self.execution_elapsed = 0.0
         elif self.state in (SystemState.FIRST_OBS, SystemState.RUNNING):
             self.get_logger().info("🛑 User pressed '1': stopping execution and resetting system")
             self._switch_state(SystemState.RESETTING)

@@ -5,6 +5,7 @@ These tests never connect to the robot or model server.
 """
 import importlib.util
 import io
+import json
 from pathlib import Path
 import threading
 import time
@@ -54,6 +55,8 @@ def make_node(state=State.RUNNING):
     node.state = state
     node.current_instr = 'old task'
     node.episode_generation = 0
+    node.execution_started_at = None
+    node.execution_elapsed = 0.0
     node.commander_generation = 0
     node.commander_mode = 'model'
     node.bootstrap_inference = False
@@ -74,6 +77,44 @@ def make_node(state=State.RUNNING):
 
 
 class InstructionTests(unittest.TestCase):
+    def test_only_valid_key_one_confirmation_starts_execution_clock(self):
+        node=make_node(State.IDLE)
+        node._handle_key_press(SimpleNamespace(char='1'))
+        self.assertEqual(node._execution_clock_snapshot(),('waiting',0.0))
+        node.state=State.READY
+        node.human_in_the_loop=False
+        node._start_human_input_nodes=MagicMock()
+        node._transition_commander=MagicMock()
+        node.play_sound=MagicMock()
+        node.pub_system_mode=MagicMock()
+        node._image_buffers_empty=MagicMock(return_value=True)
+        node.buf_l_wrist=node.buf_r_wrist=node.buf_l_kps=node.buf_r_kps=deque()
+        node.action_queue.clear()
+        node._handle_key_press(SimpleNamespace(char='1'))
+        self.assertEqual(node.state,State.FIRST_OBS)
+        self.assertEqual(node._execution_clock_snapshot()[0],'running')
+        start=node.execution_started_at
+        node.update_instruction('new language instruction',node.episode_generation)
+        self.assertEqual(node.execution_started_at,start)
+        node._switch_state(State.RESETTING)
+        phase,elapsed=node._execution_clock_snapshot()
+        self.assertEqual(phase,'stopped')
+        self.assertIsNone(node.execution_started_at)
+        self.assertGreaterEqual(elapsed,0)
+
+    def test_reset_loop_reports_stop_but_does_not_accept_instructions(self):
+        node=make_node(State.RESETTING)
+        node.execution_elapsed=12.3
+        node.ui_host,node.ui_port='localhost',8081
+        node.ui_session=MagicMock()
+        node.ui_session.get.return_value.json.return_value={'instruction':'late'}
+        with patch.object(node_module.rclpy,'ok',side_effect=[True,False]), patch.object(node_module.time,'sleep'):
+            node.remote_input_loop()
+        params=node.ui_session.get.call_args.kwargs['params']
+        self.assertEqual(params['execution'],'stopped')
+        self.assertEqual(params['elapsed'],12.3)
+        self.assertEqual(node.current_instr,'old task')
+
     def test_initial_instruction_and_ready_replacement_do_not_start_robot(self):
         node = make_node(State.IDLE)
         self.assertTrue(node.update_instruction('  first task  ', 0))
@@ -246,17 +287,20 @@ class HostInputTests(unittest.TestCase):
         self.state_patch.start()
         self.addCleanup(self.state_patch.stop)
 
-    def handler(self, instruction=None):
+    def handler(self, instruction=None, schedule=None):
         handler = server.InteractionHandler.__new__(server.InteractionHandler)
         handler._send_json = MagicMock()
-        body = urlencode({'instruction': instruction}).encode() if instruction is not None else b''
+        params = {'instruction': instruction} if instruction is not None else {}
+        if schedule is not None:
+            params['schedule'] = json.dumps(schedule)
+        body = urlencode(params).encode()
         handler.headers = {'Content-Length': str(len(body))}
         handler.rfile = io.BytesIO(body)
         return handler
 
-    def start_poll(self):
+    def start_poll(self, session='test-client:0', execution='waiting', elapsed=0.0):
         handler = self.handler()
-        worker = threading.Thread(target=handler._handle_robot_request, daemon=True)
+        worker = threading.Thread(target=handler._handle_robot_request, args=(session,execution,elapsed), daemon=True)
         worker.start()
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
@@ -299,6 +343,158 @@ class HostInputTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertFalse(self.temp_state.is_robot_waiting)
         receiver._send_json.assert_called_once_with({'instruction': None})
+
+    def arm_schedule(self, entries=None):
+        receiver, worker = self.start_poll()
+        entries = entries if entries is not None else [
+            {'after_seconds': 10, 'instruction': 'second task'},
+            {'after_seconds': 25, 'instruction': 'third task'},
+        ]
+        sender = self.handler('first task', entries)
+        sender._handle_web_submit()
+        worker.join(2)
+        sender._send_json.assert_called_once_with({'accepted': True})
+        receiver._send_json.assert_called_once_with({'instruction': 'first task'})
+
+    def test_timer_waits_for_key_confirmation_then_uses_confirmation_offsets(self):
+        self.arm_schedule()
+        with self.temp_state.command_condition:
+            self.assertEqual(self.temp_state.schedule_state, 'armed')
+            self.assertIsNone(self.temp_state.schedule_started_at)
+            self.assertIsNone(self.temp_state.take_due_instruction(time.monotonic()+100))
+            self.assertEqual(self.temp_state.schedule_status()['execution']['elapsed_seconds'], 0)
+            self.temp_state.update_execution('running', 0.4, time.monotonic())
+            start = self.temp_state.schedule_started_at
+            self.assertIsNone(self.temp_state.take_due_instruction(start + 9))
+            self.assertEqual(self.temp_state.take_due_instruction(start + 10), 'second task')
+            self.assertIsNone(self.temp_state.take_due_instruction(start + 24))
+            self.assertEqual(self.temp_state.take_due_instruction(start + 25), 'third task')
+            self.assertEqual(self.temp_state.schedule_state, 'completed')
+            self.assertIsNone(self.temp_state.take_due_instruction(start + 30))
+
+    def test_active_long_poll_wakes_at_scheduled_deadline(self):
+        self.arm_schedule([{'after_seconds': 0.15, 'instruction': 'automatic task'}])
+        receiver = self.handler()
+        worker = threading.Thread(target=receiver._handle_robot_request, args=('test-client:0','running',0.0))
+        worker.start()
+        worker.join(0.7)
+        self.assertFalse(worker.is_alive())
+        receiver._send_json.assert_called_once_with({'instruction': 'automatic task'})
+        self.assertEqual(self.temp_state.schedule_sent, 1)
+
+    def test_new_episode_or_restarted_client_cancels_old_timer_before_delivery(self):
+        for session in ['test-client:1', 'restarted-client:0']:
+            self.arm_schedule()
+            self.temp_state.update_execution('running',30,time.monotonic())
+            receiver = self.handler()
+            receiver._handle_robot_request(session)
+            receiver._send_json.assert_called_once_with({'instruction': None})
+            self.assertEqual(self.temp_state.schedule_reason, 'episode_changed')
+            self.assertEqual(self.temp_state.scheduled_commands, [])
+
+    def test_disconnect_drops_overdue_timer_instead_of_replaying_it_on_reconnect(self):
+        self.arm_schedule()
+        self.temp_state.last_input_poll -= 6
+        self.temp_state.update_execution('running',30,time.monotonic())
+        receiver = self.handler()
+        receiver._handle_robot_request('test-client:0')
+        receiver._send_json.assert_called_once_with({'instruction': None})
+        self.assertEqual(self.temp_state.schedule_reason, 'disconnected')
+
+    def test_cancel_endpoint_and_manual_instruction_remove_remaining_timer(self):
+        self.arm_schedule()
+        canceller = self.handler()
+        canceller.path = '/cancel_schedule'
+        canceller.do_POST()
+        self.assertEqual(self.temp_state.schedule_state, 'cancelled')
+        self.assertEqual(self.temp_state.scheduled_commands, [])
+        self.arm_schedule()
+        receiver, worker = self.start_poll()
+        self.handler('manual replacement')._handle_web_submit()
+        worker.join(2)
+        receiver._send_json.assert_called_once_with({'instruction': 'manual replacement'})
+        self.assertEqual(self.temp_state.schedule_reason, 'replaced')
+
+    def test_invalid_plans_never_send_initial_instruction_or_arm_timer(self):
+        invalid = [None, {}, [None], [{'after_seconds': 0, 'instruction': 'x'}],
+                   [{'after_seconds': -1, 'instruction': 'x'}],
+                   [{'after_seconds': True, 'instruction': 'x'}],
+                   [{'after_seconds': float('nan'), 'instruction': 'x'}],
+                   [{'after_seconds': float('inf'), 'instruction': 'x'}],
+                   [{'after_seconds': 86401, 'instruction': 'x'}],
+                   [{'after_seconds': 1, 'instruction': ''}],
+                   [{'after_seconds': 1, 'instruction': 'x', 'chinese': 1}],
+                   [{'after_seconds': 2, 'instruction': 'x'}, {'after_seconds': 1, 'instruction': 'y'}],
+                   [{'after_seconds': 1, 'instruction': 'x'}] * 33]
+        self.temp_state.is_robot_waiting = True
+        for plan in invalid:
+            handler = self.handler('first', plan)
+            if plan is None:
+                handler = self.handler('first')
+                handler._read_form = lambda: {'instruction': ['first'], 'schedule': ['null']}
+            handler._handle_web_submit()
+            self.assertEqual(handler._send_json.call_args.args[1], 400, plan)
+            self.assertIsNone(self.temp_state.current_command)
+            self.assertEqual(self.temp_state.schedule_state, 'idle')
+
+    def test_legacy_client_cannot_arm_schedule_without_episode_tracking(self):
+        receiver, worker = self.start_poll(session=None)
+        handler = self.handler('first', [{'after_seconds': 1, 'instruction': 'next'}])
+        handler._handle_web_submit()
+        self.assertEqual(handler._send_json.call_args.args[1], 409)
+        self.handler('manual')._handle_web_submit()
+        worker.join(2)
+        receiver._send_json.assert_called_once_with({'instruction': 'manual'})
+
+    def test_waiting_polls_do_not_send_followups_even_after_the_configured_delay(self):
+        self.arm_schedule([{'after_seconds':0.01,'instruction':'must wait for key 1'}])
+        receiver, worker = self.start_poll()
+        worker.join(2)
+        receiver._send_json.assert_called_once_with({'instruction':None})
+        self.assertEqual(self.temp_state.schedule_state,'armed')
+        with self.temp_state.command_condition:
+            self.assertEqual(self.temp_state.schedule_status()['execution']['elapsed_seconds'],0)
+
+    def test_clock_continues_after_plan_completes_and_stops_on_reset(self):
+        self.arm_schedule()
+        with self.temp_state.command_condition:
+            now=time.monotonic()
+            self.temp_state.update_execution('running',30,now)
+            self.temp_state.take_due_instruction(now)
+            self.temp_state.take_due_instruction(now)
+            self.assertEqual(self.temp_state.schedule_state,'completed')
+            self.assertAlmostEqual(self.temp_state.execution_status(now+5)['elapsed_seconds'],35)
+            self.temp_state.update_execution('stopped',36,now+6)
+            self.assertEqual(self.temp_state.execution_status(now+100)['elapsed_seconds'],36)
+
+    def test_repeated_running_reports_do_not_restart_timer_and_cancel_keeps_clock(self):
+        self.arm_schedule()
+        with self.temp_state.command_condition:
+            now=time.monotonic()
+            self.temp_state.update_execution('running',2,now)
+            start=self.temp_state.schedule_started_at
+            self.temp_state.update_execution('running',3,now+1)
+            self.assertEqual(self.temp_state.schedule_started_at,start)
+            self.temp_state.cancel_schedule('user')
+            self.assertEqual(self.temp_state.execution_status(now+2)['elapsed_seconds'],4)
+
+    def test_stop_report_cancels_plan_without_delivering_due_instruction(self):
+        self.arm_schedule()
+        self.temp_state.update_execution('running',30,time.monotonic())
+        receiver=self.handler()
+        receiver._handle_robot_request('test-client:1','stopped',30)
+        receiver._send_json.assert_called_once_with({'instruction':None})
+        self.assertEqual(self.temp_state.schedule_state,'cancelled')
+        self.assertEqual(self.temp_state.execution_phase,'stopped')
+
+    def test_new_plan_during_execution_is_rejected_without_replacing_instruction(self):
+        receiver,worker=self.start_poll(execution='running',elapsed=5)
+        sender=self.handler('new',[{'after_seconds':10,'instruction':'next'}])
+        sender._handle_web_submit()
+        self.assertEqual(sender._send_json.call_args.args[1],409)
+        self.handler('manual')._handle_web_submit()
+        worker.join(2)
+        receiver._send_json.assert_called_once_with({'instruction':'manual'})
 
 
 if __name__ == '__main__':
