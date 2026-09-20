@@ -199,7 +199,7 @@ class GlobalState:
     def __init__(self):
         self.is_robot_waiting = False
         self.current_command = None     # English instruction sent to the robot
-        self.command_event = threading.Event()
+        self.command_condition = threading.Condition()
         self.server_ready = False
         self.history = self._load_history()
 
@@ -352,7 +352,7 @@ HTML_PAGE = """
         const T = {
             en: {
                 title:"Robot Stack Instruction Terminal", idle:"Inference program is not requesting input; waiting...",
-                active:"Inference program is requesting input; please respond", enLabel:"English", zhLabel:"Chinese",
+                active:"Ready for instructions — submit a new instruction during execution to change the task", enLabel:"English", zhLabel:"Chinese",
                 submit:"Confirm and Send Instruction", sent:"Sent", historyTitle:"Recently Used Instructions",
                 phType:"Type the instruction...", phWait:"Waiting for a request...",
                 hintEn:"Type an English instruction and press Enter.",
@@ -365,7 +365,7 @@ HTML_PAGE = """
             },
             cn: {
                 title:"机器人指令终端", idle:"推理程序暂未请求输入，等待中…",
-                active:"推理程序正在请求输入，请输入指令", enLabel:"英文", zhLabel:"中文",
+                active:"可输入指令；执行过程中再次发送即可切换任务，无需重新踩踏板", enLabel:"英文", zhLabel:"中文",
                 submit:"确认并发送指令", sent:"已发送", historyTitle:"最近使用的指令",
                 phType:"请输入指令…", phWait:"等待请求…",
                 hintEn:"输入英文指令后回车。",
@@ -456,7 +456,7 @@ HTML_PAGE = """
             const was=waiting; waiting=Boolean(w);
             if(waiting){ indicator.textContent=L.active; indicator.className="active-msg";
                          body.classList.remove('status-idle'); body.classList.add('status-active'); }
-            else { busy=false; indicator.textContent=L.idle; indicator.className="idle-msg";
+            else { indicator.textContent=L.idle; indicator.className="idle-msg";
                    body.classList.remove('status-active'); body.classList.add('status-idle'); setStatus(""); }
             refresh();
             if(waiting&&!was) (MODE==='cn'?chineseInput:englishInput).focus();
@@ -482,17 +482,18 @@ HTML_PAGE = """
         }
 
         form.onsubmit=async e=>{
-            e.preventDefault(); if(!waiting||busy) return;
-            if(!await ensureEnglish()) return;
-            const en=englishInput.value.trim();
-            if(!en){ setStatus(L.emptyEn,"error"); return; }
+            e.preventDefault(); if(!waiting||busy||translating) return;
             busy=true; refresh(); const orig=L.submit;
             try{
+                if(!await ensureEnglish()) return;
+                const en=englishInput.value.trim();
+                if(!en){ setStatus(L.emptyEn,"error"); return; }
                 const r=await fetch('/web_submit',{method:'POST',body:new URLSearchParams({instruction:en, chinese:chineseInput.value.trim()})});
                 const d=await r.json().catch(()=>({}));
                 if(!r.ok||d.accepted===false) throw new Error(d.error||L.sendFail);
                 btn.textContent=L.sent; setStatus(L.instrSent,"ok"); setTimeout(()=>btn.textContent=orig,1000);
-            }catch(e){ busy=false; btn.textContent=orig; setStatus(e.message||L.sendFail,"error"); refresh(); }
+            }catch(e){ btn.textContent=orig; setStatus(e.message||L.sendFail,"error"); }
+            finally{ busy=false; refresh(); }
         };
         refresh(); poll();
     </script>
@@ -516,7 +517,10 @@ class InteractionHandler(BaseHTTPRequestHandler):
         if self.path == '/':
             self._send_html()
         elif self.path == '/status':
-            self._send_json({"waiting": state.is_robot_waiting, "history": state.history})
+            with state.command_condition:
+                status = {"waiting": state.is_robot_waiting and state.current_command is None,
+                          "history": list(state.history)}
+            self._send_json(status)
         elif self.path == '/get_input':
             self._handle_robot_request()
         else:
@@ -533,15 +537,22 @@ class InteractionHandler(BaseHTTPRequestHandler):
             self.send_error(404)
 
     def _handle_robot_request(self):
-        logger.info("📡 Inference program requested input")
-        state.command_event.clear()
-        state.is_robot_waiting = True
-        state.command_event.wait(timeout=None)
-        if state.current_command:
-            self._send_json({"instruction": state.current_command})
-            logger.info(f"✅ Instruction delivered: '{state.current_command}'")
-        state.is_robot_waiting = False
-        state.current_command = None
+        # A bounded poll releases disconnected clients and lets the robot stop
+        # accepting instructions during reset. There is only one consumer.
+        with state.command_condition:
+            if state.is_robot_waiting:
+                self._send_json({"error": "Another input request is active"}, 409)
+                return
+            state.is_robot_waiting = True
+            try:
+                state.command_condition.wait_for(lambda: state.current_command is not None, timeout=1.0)
+                instruction = state.current_command
+                state.current_command = None
+            finally:
+                state.is_robot_waiting = False
+        self._send_json({"instruction": instruction})
+        if instruction:
+            logger.info(f"✅ Instruction delivered: '{instruction}'")
 
     def _handle_web_submit(self):
         params = self._read_form()
@@ -550,12 +561,13 @@ class InteractionHandler(BaseHTTPRequestHandler):
         if not instr:
             self._send_json({"accepted": False, "error": "Instruction cannot be empty"}, 400)
             return
-        if not state.is_robot_waiting:
-            self._send_json({"accepted": False, "error": "Inference program is not requesting input"}, 409)
-            return
-        state.current_command = instr
-        state.save_command(instr, chinese)
-        state.command_event.set()
+        with state.command_condition:
+            if not state.is_robot_waiting or state.current_command is not None:
+                self._send_json({"accepted": False, "error": "Inference program is not requesting input; retry shortly"}, 409)
+                return
+            state.current_command = instr
+            state.save_command(instr, chinese)
+            state.command_condition.notify()
         self._send_json({"accepted": True})
 
     def _handle_translate(self):

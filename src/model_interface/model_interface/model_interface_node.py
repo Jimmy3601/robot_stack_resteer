@@ -85,7 +85,7 @@ class ModelInterfaceNode(Node):
         self.r_pose_cb_lock = threading.Lock()
         self.l_kp_cb_lock = threading.Lock()
         self.r_kp_cb_lock = threading.Lock()
-        self.action_timer_lock = threading.Lock()
+        self.action_timer_lock = threading.RLock()
         self.inference_lock = threading.Lock()
         self.commander_lock = threading.Lock()
         self.infer_event = threading.Event()
@@ -209,6 +209,7 @@ class ModelInterfaceNode(Node):
         # --- 5. Data structures ---
         self.state = SystemState.IDLE
         self.current_instr = ""
+        self.episode_generation = 0
 
         self.action_queue = deque(maxlen=200)
         self.action_queue_copy = list(self.action_queue)
@@ -524,26 +525,43 @@ class ModelInterfaceNode(Node):
         return list(self.rgb_cb_locks.values()) + list(self.depth_cb_locks.values())
 
     def _switch_state(self, new_state):
+        # Reset must invalidate pending inference without waiting for the network.
+        if new_state == SystemState.RESETTING:
+            with self.action_timer_lock:
+                self._execute_switch_state(new_state)
+                self.episode_generation += 1
+                self.current_instr = ""
+                with self.commander_lock:
+                    self.commander_generation += 1
+                    self.bootstrap_inference = False
+                self.action_queue.clear()
+                self.action_queue_copy = []
+                self.infer_event.clear()
+            self._clear_reset_buffers()
+            return
+        with self.action_timer_lock:
+            self._switch_active_state(new_state)
+
+    def _clear_reset_buffers(self):
+        with ExitStack() as stack:
+            stack.enter_context(self.action_timer_lock)
+            for lock in self._image_locks():
+                stack.enter_context(lock)
+            stack.enter_context(self.l_pose_cb_lock)
+            stack.enter_context(self.r_pose_cb_lock)
+            stack.enter_context(self.l_kp_cb_lock)
+            stack.enter_context(self.r_kp_cb_lock)
+            self._clear_image_buffers()
+            self.buf_l_wrist.clear()
+            self.buf_r_wrist.clear()
+            self.buf_l_kps.clear()
+            self.buf_r_kps.clear()
+        self.get_logger().info("🧹 Reset complete: cleared action queue and buffers")
+
+    def _switch_active_state(self, new_state):
         old_state = self.state
         if old_state == new_state: return
-        if new_state == SystemState.RESETTING:
-            with ExitStack() as stack:
-                # inference_lock → action_timer_lock → buffer locks (must match inference_worker).
-                stack.enter_context(self.inference_lock)
-                stack.enter_context(self.action_timer_lock)
-                for lock in self._image_locks():
-                    stack.enter_context(lock)
-                stack.enter_context(self.l_pose_cb_lock)
-                stack.enter_context(self.r_pose_cb_lock)
-                stack.enter_context(self.l_kp_cb_lock)
-                stack.enter_context(self.r_kp_cb_lock)
-                self._execute_switch_state(new_state)
-                self.action_queue.clear()
-                self._clear_image_buffers()
-                self.buf_l_wrist.clear()
-                self.buf_r_wrist.clear(); self.buf_l_kps.clear(); self.buf_r_kps.clear()
-            self.get_logger().info(f"🧹 Reset complete: cleared action queue and buffers")
-        elif new_state == SystemState.FIRST_OBS:
+        if new_state == SystemState.FIRST_OBS:
             assert not self.action_queue, "action queue should be empty in FIRST_OBS state"
             assert self._image_buffers_empty(), "image buffers should be empty in FIRST_OBS state"
             assert not self.buf_l_wrist, "left wrist buffer should be empty in FIRST_OBS state"
@@ -553,6 +571,40 @@ class ModelInterfaceNode(Node):
             self._execute_switch_state(new_state)
         else:
             self._execute_switch_state(new_state)
+
+    def update_instruction(self, instruction, episode_generation):
+        """Replace the task atomically with respect to action publication and inference."""
+        if not isinstance(instruction, str) or not instruction.strip():
+            return False
+        instruction = instruction.strip()
+        with self.action_timer_lock:
+            if self.state == SystemState.RESETTING or episode_generation != self.episode_generation:
+                self.get_logger().info("Ignoring instruction from an ended episode")
+                return False
+            if instruction == self.current_instr:
+                return True
+            self.current_instr = instruction
+            active = self.state in (SystemState.FIRST_OBS, SystemState.RUNNING)
+            with self.commander_lock:
+                self.commander_generation += 1
+                model_active = active and self.commander_mode == 'model'
+                self.bootstrap_inference = model_active
+            self.action_queue.clear()
+            self.action_queue_copy = []
+            self.infer_event.clear()
+            if self.state == SystemState.IDLE:
+                self._switch_state(SystemState.READY)
+            if model_active:
+                # Replace the downstream IK targets as well as the local action queue.
+                try:
+                    self._publish_hold_action_from_latest_state()
+                except AssertionError:
+                    # FIRST_OBS can still be waiting for its first sensor samples.
+                    self.get_logger().info("Waiting for observations before replanning")
+                self.infer_event.set()
+            self.pub_instruction.publish(String(data=instruction))
+            self.get_logger().info(f"✅ Instruction updated: '{instruction}'")
+        return True
 
     def _transition_commander(self, mode, bootstrap=False):
         if mode not in ('human', 'model'):
@@ -670,7 +722,8 @@ class ModelInterfaceNode(Node):
             self.get_logger().info("User pressed '3': no recording to stop or discard, ignoring")
 
     def _reset_after_episode_end(self):
-        self._switch_state(SystemState.RESETTING)
+        if self.state != SystemState.RESETTING:
+            self._switch_state(SystemState.RESETTING)
         self.play_sound("stop_and_reset")
         self.pub_system_mode.publish(String(data="reset"))
         self._stop_human_input_nodes()
@@ -902,10 +955,7 @@ class ModelInterfaceNode(Node):
         raw_action[..., 18:] = rel_action[..., 18:] + state[18:]
         return raw_action
 
-    def prepare_inference_payload(self):
-        with self.commander_lock:
-            bootstrap_inference = self.bootstrap_inference
-
+    def prepare_inference_payload(self, instruction, bootstrap_inference, first_observation, action_queue):
         # Snapshot all buffers under their locks
         snap_rgb = {}
         for name, buf in self.buf_rgb.items():
@@ -951,7 +1001,7 @@ class ModelInterfaceNode(Node):
             self._print_buffer_info("Left Kps", snap_lk)
             self._print_buffer_info("Right Kps", snap_rk)
 
-        if self.state == SystemState.FIRST_OBS:
+        if first_observation:
             rgb_inputs = {
                 name: np.stack([snap[-1][1]])
                 for name, snap in snap_rgb.items()
@@ -1038,13 +1088,13 @@ class ModelInterfaceNode(Node):
 
             if self.act_rtc_len > 0 and not bootstrap_inference:
                 if self.act_mode == 'absolute':
-                    action_rtc = np.array([item['raw'] for item in islice(self.action_queue_copy, 0, self.act_rtc_len)])
+                    action_rtc = np.array([item['raw'] for item in islice(action_queue, 0, self.act_rtc_len)])
                 elif self.act_mode == 'relative':
-                    action_rtc = np.array([self.get_relative_action(states_in[-1], item['raw']) for item in islice(self.action_queue_copy, 0, self.act_rtc_len)])
+                    action_rtc = np.array([self.get_relative_action(states_in[-1], item['raw']) for item in islice(action_queue, 0, self.act_rtc_len)])
             else:
                 action_rtc = None
 
-        instr = self.current_instr
+        instr = instruction
         rgb_in = rgb_inputs[self.cam_name]
         depth_in = depth_inputs.get(self.cam_name)
         
@@ -1082,17 +1132,26 @@ class ModelInterfaceNode(Node):
     def inference_worker(self):
         while rclpy.ok():
             self.infer_event.wait()
-            with self.commander_lock:
-                infer_generation = self.commander_generation
-                bootstrap_inference = self.bootstrap_inference
+            with self.action_timer_lock:
+                with self.commander_lock:
+                    infer_generation = self.commander_generation
+                    bootstrap_inference = self.bootstrap_inference
+                    if self.commander_mode != 'model' or not self._is_active_recording(self.state):
+                        self.infer_event.clear()
+                        continue
+                instruction = self.current_instr
+                first_observation = self.state == SystemState.FIRST_OBS
+                action_queue = list(self.action_queue_copy)
             try:
                 with self.inference_lock:
                     if self.debug_code:
-                        self.get_logger().info(f"🧠 Starting inference: instruction='{self.current_instr}'")
+                        self.get_logger().info(f"🧠 Starting inference: instruction='{instruction}'")
                     start_time = time.time()
 
                     try:
-                        payload = self.prepare_inference_payload()
+                        payload = self.prepare_inference_payload(
+                            instruction, bootstrap_inference, first_observation, action_queue
+                        )
                     except AssertionError as e:
                         self.get_logger().warn(f"⚠️  Data preparation failed: {e}, waiting for more data...")
                         time.sleep(0.02)
@@ -1114,7 +1173,7 @@ class ModelInterfaceNode(Node):
                             self.get_logger().info("🧹 Inference result is stale, discarding this action queue update")
                             continue
 
-                        if self.state == SystemState.FIRST_OBS or bootstrap_inference:
+                        if first_observation or bootstrap_inference:
                             action_start = 0
                             action_end = self.act_len + self.act_rtc_len
                         else:
@@ -1138,33 +1197,37 @@ class ModelInterfaceNode(Node):
                             with self.commander_lock:
                                 current_generation = self.commander_generation
                                 current_commander = self.commander_mode
-                                if infer_generation != current_generation or current_commander != 'model':
+                                if (infer_generation != current_generation or current_commander != 'model'
+                                        or not self._is_active_recording(self.state)):
                                     self.get_logger().info("🧹 Inference result is stale, discarding this action queue update")
                                     continue
                                 self.bootstrap_inference = False
                             self.action_queue.extend(new_actions)
                             self.get_logger().info(f"📥 Action queue updated: current length={len(self.action_queue)}")
 
-                        if self.state == SystemState.FIRST_OBS:
-                            self._switch_state(SystemState.RUNNING)
-                            with ExitStack() as stack:
-                                for lock in self._image_locks():
-                                    stack.enter_context(lock)
-                                self._clear_image_buffers()
-                            with self.l_pose_cb_lock:
-                                self.buf_l_wrist.clear()
-                            with self.r_pose_cb_lock:
-                                self.buf_r_wrist.clear()
-                            with self.l_kp_cb_lock:
-                                self.buf_l_kps.clear()
-                            with self.r_kp_cb_lock:
-                                self.buf_r_kps.clear()
+                            if self.state == SystemState.FIRST_OBS:
+                                self._switch_state(SystemState.RUNNING)
+                                with ExitStack() as stack:
+                                    for lock in self._image_locks():
+                                        stack.enter_context(lock)
+                                    self._clear_image_buffers()
+                                with self.l_pose_cb_lock:
+                                    self.buf_l_wrist.clear()
+                                with self.r_pose_cb_lock:
+                                    self.buf_r_wrist.clear()
+                                with self.l_kp_cb_lock:
+                                    self.buf_l_kps.clear()
+                                with self.r_kp_cb_lock:
+                                    self.buf_r_kps.clear()
                     except Exception as e:
                         self.get_logger().error(f"❌ Inference error: {e}", exc_info=True)
                         time.sleep(0.1)
             finally:
                 with self.action_timer_lock:
-                    self.infer_event.clear()
+                    with self.commander_lock:
+                        # Preserve wakeups from instructions received in flight.
+                        if infer_generation == self.commander_generation:
+                            self.infer_event.clear()
 
     # --- Control timer ---
     def control_timer_cb(self):
@@ -1178,12 +1241,18 @@ class ModelInterfaceNode(Node):
                 return
 
             if bootstrap_inference and not self.infer_event.is_set():
-                self.get_logger().info("Triggering inference: rebuilding action queue after model control resumed")
+                self.get_logger().info("Triggering inference: rebuilding action queue for the current instruction")
                 self.action_queue_copy = list(self.action_queue)
                 self.infer_event.set()
                 return
 
-            if len(self.action_queue) == self.act_rtc_len and not self.infer_event.is_set():
+            if len(self.action_queue) <= self.act_rtc_len and not self.infer_event.is_set():
+                if len(self.action_queue) < self.act_rtc_len:
+                    # A failed request can drain the prefix before the retry.
+                    # Replan without conditioning on an incomplete RTC prefix.
+                    with self.commander_lock:
+                        self.bootstrap_inference = True
+                    self.action_queue.clear()
                 self.get_logger().info(f"Triggering inference")
                 self.action_queue_copy = list(self.action_queue)
                 self.infer_event.set()
@@ -1211,19 +1280,20 @@ class ModelInterfaceNode(Node):
                 self.get_logger().warn(f"⚠️  Action publish failed: {e}")
 
     def remote_input_loop(self):
-        """Blocking instruction input fetched from the host service via HTTP GET."""
+        """Receive instructions before and during execution using bounded long polls."""
         self.get_logger().info(f"🌐 Remote input loop started: waiting to connect to {self.ui_host}:{self.ui_port}")
         while rclpy.ok():
-            if self.state == SystemState.IDLE:
+            with self.action_timer_lock:
+                accepting_input = self.state != SystemState.RESETTING
+                episode_generation = self.episode_generation
+            if accepting_input:
                 try:
                     url = f"http://{self.ui_host}:{self.ui_port}/get_input"
-                    self.get_logger().info(f"📡 Requesting remote input: {url} (no timeout, waiting for user input...)")
-                    resp = self.ui_session.get(url, timeout=None).json()
-                    
-                    self.current_instr = resp["instruction"]
-                    self._switch_state(SystemState.READY)
-
-                    self.get_logger().info(f"✅ Instruction received: '{self.current_instr}'")
+                    response = self.ui_session.get(url, timeout=(3.0, 5.0))
+                    response.raise_for_status()
+                    instruction = response.json().get("instruction")
+                    if instruction is not None:
+                        self.update_instruction(instruction, episode_generation)
                 except requests.exceptions.ConnectionError as e:
                     self.get_logger().warn(f"⚠️  Cannot connect to host service: {e}")
                     time.sleep(2.0)
@@ -1278,6 +1348,7 @@ class ModelInterfaceNode(Node):
             self._switch_state(SystemState.FIRST_OBS)
         elif self.state in (SystemState.FIRST_OBS, SystemState.RUNNING):
             self.get_logger().info("🛑 User pressed '1': stopping execution and resetting system")
+            self._switch_state(SystemState.RESETTING)
             self._transition_commander('model')
             self._stop_recording_if_running()
             self._reset_after_episode_end()

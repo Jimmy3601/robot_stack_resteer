@@ -145,7 +145,20 @@ Then, inside the container, launch the stack and the inference client, each in i
 robot --inference   # cameras + arms + hands
 interface           # inference client
 ```
-With everything running, the operator types a natural-language instruction into the web terminal, and it is delivered to the robot whenever the model requests one. Execution is controlled with a single foot pedal. Pedal 1 starts execution, and the next press ends execution and resets the robot.
+With everything running, type a natural-language instruction into the web terminal. Pedal 1 starts execution, and the next press ends execution and resets the robot.
+
+**Changing the task during execution.** Keep the web terminal open and send another instruction while the robot is running, for example changing "Put the cup on the left" to "Put the cup on the right". The new text replaces the entire current instruction; you do not need to press the pedal again. English, Chinese (`--cn`, translated to English), and bilingual (`--dev`) input all use the same update path. You can also replace the instruction before pressing Pedal 1. Sending identical text again leaves the current execution unchanged.
+
+When a new instruction arrives, the client clears the pending action queue, sends the latest observed pose/keypoints as hold targets, and replans from the available observations without the old task's RTC action prefix. Results from earlier instructions are discarded, including results already in flight. If several updates arrive while inference is pending, the next request uses the latest instruction. Observation history is preserved, and instruction changes are published on `/interface/instruction` for recording. During human takeover, a new instruction updates the task without returning control to the model; Pedal 2 resumes model control with the latest instruction.
+
+Restart both the host instruction terminal and the inference client after updating. The WebSocket payload still uses the existing `instruction` field, so the model server must read that field on every request. Switching waits for any in-flight inference to return before submitting the new request; it does not cancel server computation. Hold targets use the existing IK/interpolation pipeline and are not an emergency stop. Reset stops accepting instructions, and late input from the previous episode is ignored; wait for the terminal to become available again before submitting the next episode's instruction.
+
+Control-flow regression tests can run without ROS or robot hardware:
+```bash
+python3 -m unittest discover -s tests -v
+node --test tests/test_instruction_terminal.mjs  # optional UI tests; requires Node.js
+```
+These tests stub ROS, numerical operations, and model transport; they do not validate physical motion or model instruction-following quality. For a sensor/model integration check, use `mock` and `interface` as described below, send one instruction, start with Pedal 1, then send another and check the client logs for the updated instruction and discarded stale results.
 
 ### Human-in-the-loop correction
 This mode runs model inference while allowing the operator to intervene. The model controls the robot by default, and at any moment the operator can take over, steering the arms and hands exactly as in teleoperation, correct the model's behavior, and then return control to the model. Takeover relies on *relative motion mapping*. From the instant the operator takes over, the change in the operator's motion relative to that instant is applied to the robot's current pose, ensuring that the arms and hands continue smoothly from where they are rather than jumping to the operator's absolute pose. The operator is therefore advised to mirror the robot's motion throughout the episode, which makes intervention easier to carry out successfully and keeps the operation intuitive.
